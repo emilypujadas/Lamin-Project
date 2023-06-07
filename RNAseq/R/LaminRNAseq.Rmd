@@ -1,0 +1,1553 @@
+---
+title: "LaminRNAseq"
+author: "Lucas Carter"
+date: "2023-04-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown contains all of the code used to analyze the transcriptomic data with [DESeq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html) for three conditions, 24 Hour Auxin Treatment, 6 Day Washoff, and an Untreated control.These were done using an [AID degron](https://www.nature.com/articles/nmeth.1401) HCT116 line for both lamins. There are two replicates for each condition and 4 lanes for each replicate. All 4 lanes for each replicate are collapsed into one set of counts to simplify the analysis. 
+
+The non-generic sections (those specific to this analysis) are denoted as such. Each generic section is wrapped into a function intended for customizable future DGE analysis. Before each function is an explanation of use and documentation of external packages called in each function. 
+
+upregulated color: #D22B2B  
+downregulated color: #0047AB  
+
+I had to remove the gene version form the Ensembl ID (format: .##) using the following code at a few different places in this project.  
+```{r, eval = FALSE}
+rownames(results) <- gsub("\\..*","",rownames(results))
+rownames(dds) <- gsub("\\..*","",rownames(dds))
+```
+
+#### Load initial packages here  
+
+Loads initial packages  
+
+```{r, message=FALSE, warning=FALSE}
+
+rm(list = ls())
+
+# import packages
+library("DESeq2")
+library("ggplot2")
+library("dplyr")
+library("magrittr")
+library("tximport")
+library(plyranges)
+library(GenomicRanges)
+library(forcats)
+
+```
+
+#### Set Directory, pass in  counts, filter counts for DGE analysis  
+
+In the initial step, directories are set, the counts are passed in as raw [RSEM](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-12-323) counts using the [Tximport package](https://bioconductor.org/packages/release/bioc/html/tximport.html), 0 counts are replaced with 1, and the conditions for the experiment are factored out in preparation for DGE analysis using DESeq2.  
+
+```{r, eval = FALSE}
+
+# Set directory variables here
+dir.dge.res.rsem <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Results"
+dir.plt.res <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Results/Plots"
+dir.meta.res <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Results/Metascape"
+dir.rsem <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Counts/Adli_Lamin_RNA-seq_RawData_RSEM_counts"
+
+list.files(dir.rsem)
+setwd(dir.rsem)
+
+sample <- read.table(file.path(dir.rsem, "metadata.csv"), sep= ",", header= TRUE)
+newcolnames <-sample$Alias
+
+## Import files
+files <- file.path(dir.rsem, paste0(sample$ID))
+files
+
+## Imports RSEM TPM files into a list
+cts <- tximport(files, type = "rsem", txIn = FALSE, txOut = FALSE)
+
+## Move col names from sample info to counts matrix
+colnames(cts$counts)<-newcolnames
+colnames(cts$counts)
+
+#Replace any transcripts with length 0 with a 1
+cts$length[cts$length == 0] <- 1
+head(cts$counts)
+
+# logical test to see if ^ is true now
+identical(sample$Alias, colnames(cts$counts))
+
+# Store the file names in the sample info matrix as row names
+row.names(sample) <- sample$Alias
+head(sample, n=10)
+
+dput(as.character(unique(sample$Conditions)))
+
+#factor out dependencies
+sample$Conditions <- factor(sample$Conditions, levels = c( "0hr","12hr","48hr","144hr"))
+levels(sample$Conditions)
+
+sample$Replicate <- factor(sample$Replicate, levels = c(1, 2))
+levels(sample$Replicate)
+
+sample$Lane <- factor(sample$Lane, levels = c(1, 2, 3, 4))
+levels(sample$Lane)
+
+sample$Label <- factor(sample$Label, levels = dput(as.character(unique(sample$Label))))
+levels(sample$Label)
+```
+
+
+#### Create DESeq data object and apply transformations to data for pre-DGE QC  
+
+We genereate a DESeq object here using the imported transcripts from Tximport, collapse the lanes into single replicates, and the counts are filtered to remove low counts.  
+
+```{r, eval = FALSE}
+# Create DDS object
+dds <- DESeqDataSetFromTximport(cts, colData = sample, design = ~ Conditions)
+
+# Collapse lanes together into single replicates (described here: https://www.biostars.org/p/260838/ and here: https://rdrr.io/bioc/DESeq2/man/collapseReplicates.html)
+dds <- collapseReplicates(dds, dds$Label, dds$Lane)
+dds$runsCollapsed
+
+# check dds object
+summary(dds)
+
+# Pre-filtering the dataset
+nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > 0, ]
+nrow(dds)
+
+# Add another column which defines the group that each sample is in
+dds$group <- factor(paste0(dds$Conditions))
+
+# Find size factors to normalize differences in sequencing depth across samples
+# a DESeq2 algorithm for normalization of count data, conceptually comparable to CPM or TPM
+dds <- estimateSizeFactors(dds)
+```
+
+#### Apply transformations to data for pre-DGE QC
+
+Here, we find size factors to normalize differences in sequencing depth across samples in addition to applying three variance stabilizing transformations to the data to remove the dependence of the data on the mean.These transformations are optional 
+
+__[VST](https://rdrr.io/bioc/DESeq2/man/varianceStabilizingTransformation.html): normalizes using size factors that fit the data__  
+__[RLOG](https://rdrr.io/bioc/DESeq2/man/rlog.html): applies a log transformation to reduce the skew and variance of the data__  
+__[normTransform](https://www.rdocumentation.org/packages/DESeq2/versions/1.12.3/topics/normTransform): is an optional function for applying different transformation functions + a psuedocount if needed__  
+
+```{r, eval = FALSE}
+# Variance stabilizing transformation (VST) and rlog to make data more homoskedastic
+vst <- vst(dds, blind = FALSE)
+head(assay(vst))
+
+# regularized log transformation
+rld <- rlog(dds, blind = FALSE)
+head(assay(rld),3)
+
+# normalized counts transformation
+ntd <-normTransform(dds, f=log2, pc=1)
+head(ntd)
+```
+
+#### Base R PCA Plots
+
+This snippet uses base R functions and GGPlot2 to generate four plots of all of the *unnormalized* (raw) count data: 
+
+__Plot 1:__ a PCA plot of PC1 & PC2  
+__Plot 2:__ a PCA plot of PC2 & PC3  
+__Plot 3:__ a plot of the cumulative variance  
+__Plot 4:__ a plot of the eigenvalues for each PC  
+
+finally, we retur which PCs are most important to consider in downstream analysis. 
+
+The eigenvalues are proportional to the square of the ‘standard deviation’ output of prcomp. The “Kaiser-Guttman” criterion for retaining principal components states that you only keep the ones whose eigenvalues are greater than the average eigenvalue. PCA plots are generated for PCs 1 v 2, and 2 v 3.  
+
+```{r, eval = FALSE}
+
+View(sample)
+
+sample2 <- !is.na(sample$Replicate)
+
+sample <- sample[sample2,]
+
+PCAtheme<-theme(panel.background = element_blank(),panel.border=element_rect(fill=NA),
+                panel.grid.major = element_line(),
+                panel.grid.minor = element_line(colour = "tomato", size=.25, linetype = "dashed"),
+                strip.background=element_blank(), axis.text.x=element_text(family="Arial", colour="dark blue"), axis.title.x=element_text(face="bold", size=15,family="Arial", colour="dark blue", vjust=-2),
+                axis.text.y=element_text(family="Arial", colour="dark blue"), 
+                axis.title.y=element_text(face="bold", size=15, family="Arial", colour="dark blue", vjust=2),
+                text = element_text(size=10, family="Arial"), 
+                plot.title=element_text(size=20, face="bold", family="Arial Rounded MT", color="tomato", hjust=0.0, vjust=10, lineheight=1.5),
+                plot.subtitle=element_text(size=15, face="bold", family="Arial Rounded MT", color="black", hjust=0.0, lineheight=1.5),
+                legend.title = element_text(size=12, color= "tomato",face="bold"), 
+                legend.text = element_text(size=10),
+                legend.key=element_rect(fill=NA),
+                axis.ticks=element_line(colour="black"),
+                #plot.margin=unit(c(1,1,1,1),"line")
+)
+
+library(matrixStats)
+library(ggrepel)
+
+## log normalize count table (only takes matrix as input)
+cts.norm <- as.matrix(round(counts(dds)))
+scaled = DESeq2::rlog(cts.norm, blind = TRUE)
+
+## Next we calculate the per-row variance in the transformed table.
+vars = rowVars(scaled)
+
+## Then we re-order the rows so that the most variable rows are on top.
+scaled = scaled[order(vars, decreasing = TRUE),]
+
+## Here we perform PCA using `prcomp`. We transpose (`t`) the matrix and only operate on the top 1000 most variable regions. 
+#pca = prcomp(t(scaled[1:1000,]))
+
+## To perform PCA on the entire data set
+pca = prcomp(t(scaled))
+
+## We calculate the percent variance explained by each principal component by extracting these values from the summary.
+percentVar = round(100 * summary(pca)$importance[2,])
+cumuVar = round(100 * summary(pca)$importance[3,])
+
+## Look at top variance
+head(pca$x, n=12)
+
+## Plot top PCAs for PCA1 and 2
+prTab = data.frame(pca$x, colData(dds))
+
+prTab$Conditions
+
+prTab %>% #PCA1_2_AllSamples_withlabels
+  ggplot(aes(PC1, PC2, color = Conditions)) +
+  geom_point(size = 3, alpha = 0.75) + 
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) + ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  scale_color_manual(values = c("steelblue3", "#d44842", "#9f2a63", "#65156e")) + 
+  coord_fixed() + geom_text_repel(segment.color = 'transparent', aes(label = NA), size = 3, family = "Arial Narrow", hjust = 0)+
+  labs(title="Principle Component Analysis", subtitle="PC1 & PC2: All Samples", #subtitle="Top 1000 Variable Regions", 
+       caption="")+PCAtheme
+
+## Plot top PCAs for PCA2 and 3 
+prTab %>% #PCA2_3_AllSamples_NOlabels
+  ggplot(aes(PC2, PC3, color = Conditions)) +
+  geom_point(size = 3, alpha = 0.75) + 
+  xlab(paste0("PC2: ", percentVar[2], "% variance")) + ylab(paste0("PC3: ", percentVar[3], "% variance")) + 
+  scale_color_manual(values = c("steelblue3", "#d44842", "#9f2a63", "#65156e")) + 
+  coord_fixed() + geom_text_repel(aes(label = Label), size = 3, family = "Arial Narrow", hjust = 0)+
+  labs(title="Principle Component Analysis", subtitle="PC2 & PC3: All Samples", #subtitle="Top 1000 Variable Regions", 
+       caption="")+PCAtheme
+
+## Plot cumulative variance
+b = barplot(percentVar, horiz = FALSE, las = 1, ylab = 'Variance (%)', ylim = c(0,105))
+lines(b, cumuVar, type = 'b', col = 'red')
+
+## Plot Eigens
+eigenvalues = pca$sdev^2
+plot(c(1:32), eigenvalues, xlab = 'Principal Components', ylab = 'eigenvalue', las = 1)
+
+## determing which PCAs to keep based on: 
+which(eigenvalues > mean(eigenvalues))
+```
+
+#### Generate Heatmap for QC of count data  
+
+This snippet uses [Pheatmap](https://www.rdocumentation.org/packages/pheatmap/versions/1.0.12/topics/pheatmap), [Dendsort](https://cran.rstudio.com/web/packages/dendsort/index.html), and the Pearson Correlation coefficients of the experiment samples to generate a clustered heatmap with a dendrogram for experiment conditions. The input for this is the dds object generated from calling DESeq.  
+
+```{r, eval = FALSE}
+
+## Load packages
+library(pheatmap)
+library(viridis)
+library(dendsort)
+
+# Hierachal clustering map plot for sample QC
+sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
+
+# Extract the rlog matrix from the object
+rld_mat <- assay(rld)
+
+# Compute pairwise correlation values
+rld_cor <- cor(rld_mat)    ## cor() is a base R functions
+head(rld_cor)
+
+# Plot heatmap using the correlation matrix and the metadata object
+# Organize hierachal clusters
+mat <- rld_cor
+mat_cluster_cols <- hclust(dist(t(mat)))
+mat_cluster_cols <- sort_hclust(mat_cluster_cols)
+mat_cluster_rows <- sort_hclust(hclust(dist(mat)))
+length(mat)
+
+# Colors
+colors <- colorRampPalette(c("#0047AB", "white", "#D22B2B"))(64)
+
+# Plot heat map
+p<-pheatmap(mat, 
+            color = colors,
+            fontsize = 10,
+            fontsize_row = 6, 
+            fontsize_col = 6,
+            cellwidth = 8,
+            cellheight = 8,
+            cluster_cols= mat_cluster_cols,
+            cluster_rows= mat_cluster_rows,
+            main = "Sample Correlation",
+            annotation_legend = TRUE,
+            scale="row")
+p
+
+```
+
+#### Differential expression analysis and 'results' matrices  
+
+In this section we generate the differential gene expression results using the conditions and factors defined in an earlier step. After running [DESeq()](https://bioconductor.org/packages/release/bioc/html/DESeq2.html), we generate results matrices for each contrast in the experiment.  
+
+```{r, eval = FALSE}
+
+## Generate DGE DESeqDataSet data frame
+dds <- DESeq(dds)
+
+## Which contrasts to use?
+resultsNames(dds)
+
+dput(as.character(unique(sample$Conditions)))
+
+## Generate a results matrix for Treatment vs. Control with an alpha of 0.05
+res.12hr <- results(dds, contrast = c("Conditions", "12hr", "0hr"), alpha = 0.05)
+res.48hr <- results(dds, contrast = c("Conditions", "48hr", "0hr"), alpha = 0.05)
+res.144hr <- results(dds, contrast = c("Conditions", "144hr", "0hr"), alpha = 0.05)
+
+## Wash off results matrix
+res.12hrv144hr <- results(dds, contrast = c("Conditions", "12hr", "144hr"), alpha = 0.05)
+res.48hrv144hr <- results(dds, contrast = c("Conditions", "48hr", "144hr"), alpha = 0.05)
+
+```
+
+#### Annotating the results using [Annotation Hub](https://bioconductor.org/packages/release/bioc/html/AnnotationHub.html)  
+
+This function first uses [Annotation Hub](https://bioconductor.org/packages/release/bioc/html/AnnotationHub.html) to map ENSEMBL IDs to NCBI Gene Symbols. It then replaces NAs in the dataset with (generated by DESeq2's outlier identification algorithm using Cook's Distance) with psuedocounts of 1, as well as filtering out NAs for unmapped ENSEMBL IDs. Finally, it orders the results and writes them to a CSV in dir.dge.res.  
+
+__Arguments:__  
+
+_results = the DESeq2 results object generated from DESeq::results()_  
+_filename = a string that the CSV will be saves as_  
+_db = the Annotation Hub organismal database used for the mapping_  
+_org = the organism for the mapping_  
+_key = the transcript identifier from the original counts matrix_  
+_col = the gene transcript identifier of choice that the key will be mapped to_  
+  
+__Output:__ _annotated results matrix_  
+
+```{r, eval = FALSE}
+setwd(dir.dge.res.rsem)
+
+Annotate_results <- function(results, filename, db ="OrgDb",org="Homo sapiens",
+                             key="ENSEMBL",col="SYMBOL"  ){
+  
+  require("AnnotationHub")
+  ah <- AnnotationHub() ## Connect to Annotation Hub
+  qcall <- query(ah, c(db,org)) ## Make a query to your organism/database
+  ano <- ah[[names(qcall)]] ## Annotation object
+  
+  ## Remove .## version of gene in ensembl ID
+  rownames(results) <- gsub("\\..*","",rownames(results))
+  
+  ## Determine how many of the differentially expressed genes can be mapped to a gene name
+  table(rownames(results) %in% keys(ano, key))
+  
+  ## Map gene symbols onto the results matrix using Annotation Hub function mapIDS()
+  results$symbol <- mapIds(ano, rownames(results), column = col, keytype = key)
+  
+  results$padj <- ifelse(is.na(results$padj), 1, results$padj) ## NA filtering, padj
+  results$pvalue <- ifelse(is.na(results$pvalue), 1, results$pvalue) ## NA filtering, pv
+  results <- na.omit(results)
+  #results$symbol <- ifelse(is.na(results$symbol), "Unknown", results$symbol) ## NA filtering, symbol
+  
+  ## Order results and save Files as CSV function
+  results <- results[order(results$padj),]
+  results <- results[c("symbol", "baseMean","log2FoldChange", "lfcSE", "stat", "pvalue", "padj" )]
+  write.csv(as.data.frame(results), file=paste(filename, "csv", sep="."))
+  
+  return(results)
+  
+}
+
+## Annotate 10nm vs control
+res.12hr <- Annotate_results(res.12hr, "laminKO_12hr_vs_Control_DGE")
+res.48hr <- Annotate_results(res.48hr, "laminKO_48hr_vs_Control_DGE")
+res.144hr <- Annotate_results(res.144hr, "laminKO_144hr_vs_Control_DGE")
+res.12hrv144hr <- Annotate_results(res.12hrv144hr, "laminKO_12hr_vs_Washout_DGE")
+res.48hrv144hr <- Annotate_results(res.48hrv144hr, "laminKO_48hr_vs_Washout_DGE")
+```
+
+#### MA Plot 1 using functions written for DESeq2  
+
+The first function, ggPlot_MA(), uses base R, ggplot2, and [apeglm](https://bioconductor.org/packages/release/bioc/html/apeglm.html) to generate [MA plots](https://en.wikipedia.org/wiki/MA_plot) of the DGE results that show the mean count for each gene agains the log fold change of each gene.  
+
+__Arguments__  
+
+_results = the DESeq2 results object generated from DESeq::results()_  
+_title =  plot title (string)_  
+_filename = a string that the CSV will be saves as_  
+_coef = the coefficient generated upon calling DEseq::resultsNames(dds)_  
+_pv = Pvalue for signal (color intensity)_  
+_dot.trans = transparency of data points_  
+_x.label = x axis label_  
+_y.label = y axis label_  
+_de.col = color of differentially expressed genes_  
+_f.col = color of 'false' non DE genes_  
+_dir.plt = results directory for saving plot_  
+  
+__Output:__ _MA plot_  
+
+```{r, eval = FALSE}
+# upregulated color: #D22B2B
+# downregulated color: #0047AB
+
+## ggPlot that takes a DESeq results object and a title and generates an MA plot
+ggPlot_MA = function (results, title, filename, coef=coef, pv=0.01, dot.trans=0.5, x.label="log10(mean counts)", 
+                      y.label="log2(fold change) treatment/control", de.col="#0047AB", f.col="grey", dir.plt= dir.plt.res
+                        ){
+  require("ggplot2")
+  require("apeglm")
+  
+  MAtheme <- theme(panel.background = element_blank(),panel.border=element_rect(fill=NA),panel.grid.major = element_line(),
+                   panel.grid.minor = element_line(colour = "black", size=.25, linetype = "dashed"),
+                   strip.background=element_blank(), axis.text.x=element_text(family="Arial", colour="black"),
+                   axis.title.x=element_text(face="bold", size=15, family="Arial", colour="black", vjust=-2),
+                   axis.text.y=element_text(family="Arial", colour="black"), 
+                   axis.title.y=element_text(face="bold", size=15,family="Arial", colour="black", vjust=2),
+                   text = element_text(size=10, family="Arial"), 
+                   plot.title=element_text(size=20, face="bold", family="Arial Rounded MT", color="black", hjust=0.0, vjust=10, lineheight=1.5),
+                   plot.subtitle=element_text(size=15, face="bold", family="Arial Rounded MT", color="black", hjust=0.0, lineheight=1.5),
+                   legend.title = element_text(size=12, color= "black", face="bold"), 
+                   legend.text = element_text(size=10),
+                   legend.key=element_rect(fill=NA),
+                   axis.ticks=element_line(colour="black"))
+  
+  res <- lfcShrink(dds, coef=coef, type="apeglm")          
+  
+  res <-  as.data.frame(res) %>% 
+    mutate(sig = pvalue < pv) %>% 
+    ggplot(aes(x = log10(baseMean), y = log2FoldChange, color = sig)) + 
+    geom_point(alpha = dot.trans) +
+    coord_cartesian(ylim = c(-10,10)) +
+    scale_color_manual(values = c("TRUE" = de.col, "FALSE" =  f.col)) +
+    geom_hline(yintercept = c(1,-1), linetype = 'dotted', color = 'darkred') +
+    MAtheme+
+    labs(title = title,
+         x = x.label,
+         y = y.label)
+  ggsave(paste(dir.plt.res,"/",filename, ".png", sep=""), dpi=200)
+  
+  return(res)
+  
+}
+resultsNames(dds) # Get results names for MA plot function
+
+### Call function for results
+ggPlot_MA(res.12hr, "Lamin KO at 12 Hours","12hr_vs_cMAplot1", "Conditions_12hr_vs_0hr")
+ggPlot_MA(res.48hr, "Lamin KO at 48 Hours","48hr_vs_cMAplot1", "Conditions_48hr_vs_0hr")
+ggPlot_MA(res.144hr, "Lamin KO at 144 Hours","144hr_vs_cMAplot1", "Conditions_144hr_vs_0hr")
+```
+
+#### MA Plot 2 using functions written for DESeq2  
+
+The second function, plot_MA(), uses a function from [ggpubr](http://www.sthda.com/english/wiki/ggpubr-create-easily-publication-ready-plots), ggmaplot() to generate an MA plot of the DGE results that show the mean count for each gene agains the log fold change of each gene.  
+  
+__Arguments__  
+  
+_results = the DESeq2 results object generated from DESeq::results()_  
+_title =  plot title (string)_  
+_filename = a string that the CSV will be saves as_  
+_coef = the coefficient generated upon calling DEseq::resultsNames(dds)_  
+_dncol = color of downregulated differentially expressed genes_  
+_upcol = color of upregulated differentially expressed genes_  
+_dir.plt = results directory for saving plot_  
+  
+__Output:__ _MA plot_  
+
+```{r, eval = FALSE}
+plot_MA <- function(coef, title, results, filename, dncol="#0047AB", upcol="#D22B2B", dir.plt=
+                      "/Users/lucascarter/Documents/IBiS/Backman_Lab/projects/Bonini/bulk_RNAseq_2021/results/plots_rsem"){
+  
+  require("apeglm")
+  require("ggpubr")
+  
+  ## Remove .## version of gene in ensembl ID
+  rownames(results) <- gsub("\\..*","",rownames(results))
+  rownames(dds) <- gsub("\\..*","",rownames(dds))
+  
+  # shrink noisy log2 fold change estimates for coefficients: DESeq2 function
+  res <- lfcShrink(dds, coef=coef, type="apeglm")
+  res <- res[rownames(res)%in% rownames(results),]
+  
+  g1<-ggmaplot(res, 
+               main = title,
+               fdr = 0.10, fc = 1, size = 2,
+               palette = c(upcol, dncol, "darkgray"),
+               legend = "top", top = -5,
+               genenames = results$symbol,
+               font.label = c("bold", 5, "black"),
+               font.legend = c("bold", 20, "black"),
+               font.main = c("bold", 30,"black", "Arial"),
+               ggtheme = ggplot2::theme_minimal()) + theme(text = element_text(size = 20, color= "black", family = "Arial Bold"))
+  
+  ggsave(paste(dir.plt.res,"/",filename, ".png", sep=""), dpi=300)
+  return(g1)
+  
+}
+
+## Find coefficients for following function
+resultsNames(dds)
+
+## Call function for results
+plot_MA("Conditions_12hr_vs_0hr", "Lamin KO at 12 Hours", res.12hr,"12hr_vs_cMAplot2")
+plot_MA("Conditions_48hr_vs_0hr", "Lamin KO at 48 Hours", res.48hr,"48hr_vs_cMAplot2")
+plot_MA("Conditions_144hr_vs_0hr", "Lamin KO at 144 Hours", res.144hr,"144hr_vs_cMAplot2")
+
+```
+
+#### Base R Volacano plot of DESeq results  
+
+This function uses base R to generate a volcano plot of differentialy expressed genes using the log fold change and p value cut-offs supplied in the arguments. Before returning the plot, it saves a copy of the plot to the designated directory.  
+  
+__Arguments__  
+  
+_results = the DESeq2 results object generated from DESeq::results()_  
+_plt.title =  plot title (string)_  
+_filename = a string that the CSV will be saves as_  
+_lfc.up = upregulated log fold change cut-off (numeric)_  
+_lfc.dn = downregulated log fold change cut-off (numeric)_  
+_padj = Pvalue adjusted cutoff_  
+_y.limits = the y axis limit of the plot_  
+_x.limits = the x axis limit of the plot_  
+_dncol = color for downregulated genes_  
+_upcol = color for upregulated genes_  
+_dir.plt = results directory for saving plot_  
+  
+__Output:__ _Volcano plot_  
+  
+lfc.up = positive integer (ex. 0.58, 1, 2)  
+lfc.dwm = negative integer (ex. -0.58, -1, -2)  
+pvadj = positive integer (ex. 0.01, 0.05. 0.1)  
+  
+_To turn on labeling of individual DEGs, 'label=delabel' and 'geom_text_repel' need to be uncommented._  
+
+```{r, eval = FALSE}
+DE_Vol_Plot <- function(results, plt.title, filename, lfc.up=1, lfc.dwn=-1,pvadj=0.01,
+                        y.limits=c(0,150), x.limits=c(-6.5,6.5),dncol="#0047AB", upcol="#D22B2B", dir.plt=
+                          "/Users/lucascarter/Documents/IBiS/Backman_Lab/projects/Emily/Lamins_RNAseq/Results/Plots") {
+  require(ggrepel)
+  require(ggplot2)
+  
+  ## Generate data frame
+  genes.rna <- data.frame(symbol = results$symbol,lfc = results$log2FoldChange, padj=results$padj, base=results$baseMean)
+  
+  resultsDN <- as.data.frame(genes.rna[which(genes.rna$lfc < lfc.dwn),])
+  resultsDN <- as.data.frame(resultsDN[which(resultsDN$padj < pvadj),])
+  length(rownames(resultsDN)) ## Gives count of down regulated
+  
+  resultsUP <- as.data.frame(genes.rna[which(genes.rna$lfc > lfc.up),])
+  resultsUP <- as.data.frame(resultsUP[which(resultsUP$padj < pvadj),])
+  length(rownames(resultsUP)) ## Gives count of up regulated  
+  
+  ## add a column of NAs
+  genes.rna$diffexpressed <- "NO"
+  ## If log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+  genes.rna$diffexpressed[genes.rna$lfc > lfc.up & genes.rna$padj < pvadj] <- "Upregulated"
+  ## If log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+  genes.rna$diffexpressed[genes.rna$lfc < lfc.dwn & genes.rna$padj < pvadj] <- "Downregulated"
+  
+  ## Create a new column "delabel" to de, that will contain the name of genes differentially expressed (NA in case they are not)
+  genes.rna$delabel <- NA
+  genes.rna$delabel[genes.rna$diffexpressed != "NO"] <- genes.rna$symbol[genes.rna$diffexpressed != "NO"]
+  
+  ## Jitter labeling
+  pos <- position_jitter(width = 0.2, seed = 1)
+  
+  vplot <- genes.rna %>% mutate(mean.intensity = base/max(base)) %>% 
+    ggplot(aes(x=lfc, y=-log10(padj), col=diffexpressed, size = mean.intensity, 
+    #label=delabel
+    )) +
+    geom_point(position = pos, alpha=0.7)+
+    scale_color_manual(name="Upregulated", values=c(dncol, "lightgrey", upcol))+
+    geom_vline(xintercept=c(lfc.dwn, lfc.up), col="red", lty = "dashed") +
+    geom_hline(yintercept=-log10(pvadj), col="red", lty = "dashed")+ 
+    #geom_text_repel(segment.color = 'transparent', position = pos, size = 3, xlim  = c(-6,6)) +
+    labs(title=plt.title, subtitle=paste(paste("Downregulated:",length(rownames(resultsDN))), paste("| Upregulated:",length(rownames(resultsUP))))) +
+    scale_y_continuous(name="-Log 10 Padj", limits=y.limits, breaks=c(0,50,100,150,200,250, 300, 350))+
+    scale_x_continuous(name="Log 2 Fold Change", limits=x.limits, breaks=c(-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7))+
+    theme( axis.line = element_line(color = "black", size = 1, linetype = "solid"),
+           axis.text.y = element_text( color="black", size=8, family = "Arial Narrow"),
+           axis.text.x = element_text(angle = 0, color="black", size=8, family = "Arial Narrow"),
+           plot.title = element_text(hjust = 0.5, color="black", face = "bold", size=15, family = "Arial Rounded MT Bold"),
+           panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+           panel.background = element_blank()) 
+  
+  ggsave(paste(dir.plt,"/",filename, ".png", sep=""), dpi=300)
+  return(vplot)
+  
+}
+### Call function for results
+DE_Vol_Plot(res.12hr,"Lamin KO at 12 Hours: Differentially Expressed Genes", "res.12hr.volplot" )
+DE_Vol_Plot(res.48hr,"Lamin KO at 48 Hours: Differentially Expressed Genes", "res.48hr.volplot" )
+DE_Vol_Plot(res.144hr,"Lamin KO at 144 Hours: Differentially Expressed Genes", "res.144hr.volplot" )
+
+### No labels (must comment out geom_text_repel() and label = ..)
+DE_Vol_Plot(res.12hr,"Lamin KO at 12 Hours: Differentially Expressed Genes", "res.12hr.volplot_nolabels" )
+DE_Vol_Plot(res.48hr,"Lamin KO at 48 Hours: Differentially Expressed Genes", "res.48hr.volplot_nolabels" )
+DE_Vol_Plot(res.144hr,"Lamin KO at 144 Hours: Differentially Expressed Genes", "res.144hr.volplot_nolabels" )
+
+```
+
+#### Generate heatmap of top Differential results   
+  
+This function takes the results object along with a specified numeric vector and returns a heatmap of significant genes that are the length of that vector. Note: some code for this function borrowed from [this tutorial](#https://genviz.org/module-04-expression/0004/02/01/DifferentialExpression/).  
+  
+__Arguments__  
+  
+_results = the DESeq2 results object generated from DESeq::results()_  
+_title =  plot title (string)_  
+_subtitle =  plot subtitle (string)_  
+_caption =  plot caption (string)_  
+_sample.n = N samples in experiment (numeric vector e.g. 1:5)_  
+_lfc.abs = absolute log fold change cut-off (positive numeric e.g. 2)_  
+_gene.n = vector for number of genes shown in heatmap (numeric vector)_  
+_n.colors = number of colors used in scaled bins for heatmap ()_  
+_vir.col = [Vidiris](https://cran.r-project.org/web/packages/viridis/vignettes/intro-to-viridis.html) color scale (must be "A", "B", "C" ect.)_  
+_breaks = sequence of breaks for heatmap bins (same as n.colors)_  
+_labels = sequence of labels corresponding to bins (n.colors - 1)_  
+_tile.width = width of each tile in the heat map_  
+_axis.text.y = the y axis label specifications (use element_blank() argument to remove labels)_  
+_axis.text.x = the x axis label specifications (use element_blank() argument to remove labels)_  
+  
+__Output:__ _Clustered DGE heatmap_  
+
+```{r, eval = FALSE}
+## As gene.n (number of tiles) increases, tile.width must increase, to keep image proportional
+Heat_Map_Counts <- function(results, title, subtitle, caption, sample.n = 1:8, padj = 0.01, lfc.abs = 1, gene.n=gene.n, 
+                            n_colors=n_colors, breaks=breaks, labels = as.character(labels), tile.width=tile.width,
+                            axis.text.x = element_text( color="black", size=7, family = "Arial Narrow", angle = 90, vjust = 0.5, hjust=1),
+                            axis.text.y = axis.text.y) {
+  
+  require(ggplot2) # ggplot() for plotting
+  require(dplyr) # data reformatting
+  require(tidyr) # data reformatting
+  require(stringr) # string manipulation
+  require(viridis) # colors package
+  require(DESeq2) # DESeq2
+  
+  
+  ## Regularized log transformation, count extraction, and normalization
+  rld <- DESeq2::rlog(dds, blind = FALSE)
+  assay <-t(scale(t(assay(rld)[,sample.n])))
+  
+  ## Remove .## version of gene in ensembl ID
+  rownames(assay) <- gsub("\\..*","",rownames(assay))
+  
+  ## Organize genes by significance and extract
+  sig.genes <- rownames(results[results$padj <= padj & abs(results$log2FoldChange) > abs(lfc.abs),])
+  results <- as.data.frame(results[rownames(results) %in% sig.genes,])
+  results <- results %>% 
+    dplyr::distinct(symbol, .keep_all = T)
+  
+  ## Order genes by LFC, pAdj, and extract N genes for heatmap
+  #results <- results[order(results$padj, decreasing = F),]
+  #results <- as.data.frame(results[order(results$log2FoldChange, decreasing = FALSE),])[gene.n,] # order the results DOWNREG
+  #results <- as.data.frame(results[order(results$log2FoldChange, decreasing = TRUE),])[gene.n,] # order the results UPREG
+  results <- as.data.frame(results)[gene.n,] # unordered results for clustering
+  
+  ## Prepare data frame for heatmapping 
+  top.heat <- as.data.frame(assay[rownames(assay)%in%rownames(results),]) %>% 
+    dplyr::mutate(label = rownames(results)) %>%
+    dplyr::mutate(symbol = results$symbol) %>% # make rownames a new column
+    tidyr::gather(key="samples",value="value", -symbol, -label) %>% # convert data to long format
+    stats::setNames(c("label", "symbol","samples","value")) %>% # rename columns
+    dplyr::mutate(regions=factor(symbol)) %>% # convert factors
+    dplyr::mutate(samples=factor(samples)) %>%  # convert factors
+    dplyr::mutate(value=as.numeric((value))) #convert value to numeric (also converts '-' to NA, gives a warning)
+  
+  ## Compute a distance calculation on both dimensions of the matrix for clustering
+  #distance.gene <- dist(as.data.frame(assay[rownames(results),])) ## average distance method
+  distance.gene <- as.dist((1 - cor(t(as.data.frame(assay[rownames(results),]))))/2) ## correlation method
+  distance.sample <- dist(t(as.data.frame(assay[rownames(results),])))
+  
+  ## Cluster based on the distance calculations
+  #cluster.gene <- hclust(distance.gene, method="average") ## average distance method
+  cluster.gene=hclust(distance.gene) ## correlation method
+  cluster.sample <- hclust(distance.sample, method="average")
+  
+  # Re-factor sample and genes for ggplot2
+  top.heat$label <- factor(top.heat$label, levels=cluster.gene$labels[cluster.gene$order])
+  top.heat$samples <- factor(top.heat$samples, levels=cluster.sample$labels[cluster.sample$order])
+  top.heat$regions <- factor(top.heat$regions, levels=top.heat$regions[cluster.gene$order])
+  
+
+  ## Apply viridis_pal function to generate a palette
+  palette <- colorRampPalette(c("#0047AB", "white", "#D22B2B"))(n_colors)
+  
+  ## Bin heat map values using cut() and factor
+  top.heat <- top.heat %>% # create a new variable from count
+    mutate(countfactor=cut(value,breaks=c(breaks), labels=c(labels))) %>% # change level order
+    mutate(countfactor=factor(as.character(countfactor),levels=rev(levels(countfactor)))) %>% # factor bins
+    arrange(factor(top.heat$label, levels=cluster.gene$labels[cluster.gene$order])) %>% # factor labels
+    arrange(factor(top.heat$regions, levels=top.heat$regions[cluster.gene$order])) # factor regions
+  
+  
+  ## Plot heat map of top 1000
+  heat.map <- top.heat %>% 
+    ggplot(aes(x=samples,y=regions,fill=countfactor))+
+    geom_tile(size=1)+coord_fixed(ratio=tile.width)+
+    scale_fill_manual(values=c(palette),na.value = "grey90")+ ## color scale 2
+    labs(title=title, subtitle=subtitle, caption=caption) +
+    scale_y_discrete(name=NULL)+
+    scale_x_discrete(name=NULL)+
+    theme(axis.text.y = axis.text.y ,
+          axis.text.x = axis.text.x ,
+          plot.title = element_text(hjust = 0.5, color="black", face = "bold", size=15,
+                                    family = "Arial Rounded MT Bold"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank())
+  
+  return(heat.map)
+  
+}
+
+## Call function for N=1000 and N=100
+Heat_Map_Counts(res.12hr, "Top 100 Differentially Expressed Genes", "", "", gene.n=1:100, tile.width = 0.4, breaks=seq(from=-1.75, to=1.75, by=0.25),
+                n_colors=14, labels=seq(from=-1.75, to=1.5, by=0.25), axis.text.y = element_text( color="black", size=4.5, family = "Arial Narrow"))
+Heat_Map_Counts(res.12hr, "Top 1000 Differentially Expressed Genes", "", "", gene.n=1:1000, tile.width = .04, breaks=seq(from=-2, to=1.75, by=0.25),
+                n_colors=15, labels=seq(from=-2, to=1.5, by=0.25),axis.text.y =element_blank())
+Heat_Map_Counts(res.12hr, "All Differentially Expressed Genes", "", "", gene.n=1:2039, tile.width = .01, breaks=seq(from=-2.25, to=2.5, by=0.25),
+                n_colors=18, labels=seq(from=-2.25, to=2.25, by=0.25),axis.text.y =element_blank())
+```
+
+#### LAD BED DEG intersection   
+  
+Using a BED file from an [HCT116 DamID-seq dataset](https://pubmed.ncbi.nlm.nih.gov/32893442/) hosted on the 4D Nucleome Data Portal, we intersected LAD coordinates with our gene coordinates to analyze how expression changes within and outside of LADs for each of our conditions.   
+  
+description of experiment: "LaminB1 DamID of HCT116 Tier 2 cells – cells were transduced with virus expressing Dam-LaminB1, gDNA was harvested after 4 days and processed for DamID-seq"  
+  
+Lamin B1: [4DNFICCV71TZ](https://data.4dnucleome.org/experiment-set-replicates/4DNES24XA7U8/)  
+Lamin B2: [4DNFIBQH62LX](https://data.4dnucleome.org/files-processed/4DNFIBQH62LX/)  
+  
+Gene coordinates for this analysis were retrieved using the [Biomart package](https://bioconductor.org/packages/release/bioc/html/biomaRt.html) and the following code:  
+
+```{r, eval = FALSE}
+## Get chrom names and sizes (formatted for ensemble)
+chrom.dir <- "/Users/lucascarter/Documents/IBiS/Backman_Lab/projects/Emily/Lamins_RNAseq/Raw_Data/Annotations/"
+list.files(chrom.dir)
+
+chroms <- read.table(file.path(chrom.dir, "hg38.chrom.sizes"), sep= "\t", header= F)
+
+library(biomaRt)
+mart <- useMart("ensembl")
+mart <- useDataset("hsapiens_gene_ensembl", mart)
+attributes <- c("ensembl_gene_id","hgnc_symbol","chromosome_name","start_position","end_position")
+filters <- c("chromosome_name","start","end")
+#values <- list(chromosome="1",start="1",end="248956422")
+
+values = list()
+for (chrom in 1:length(chroms)){
+  values <- list(chromosome=chroms$V1,start=as.character(chroms$V2),end=as.character(chroms$V3))
+}
+values
+
+## Get all gene positions and metadata
+all.genes <- getBM(attributes=attributes, filters=filters, values=values, mart=mart)
+
+## Convert to Genomic Ranges data
+gr <- as.data.frame(all.genes)
+gr <- gr %>% 
+   transform( seqnames= gr$chromosome_name, start = gr$start_position, end = gr$end_position)  %>% 
+   as_granges()
+gr
+ 
+## Write out BED
+write_bed(gr, file=paste0(chrom.dir,"hg38_gene_positions.bed"))
+
+## Write out DF
+write.csv(as.data.frame(all.genes), file=paste0(chrom.dir,"hg38_gene_positions.csv"))
+
+```
+
+#### LAD BED DEG intersection continued:  
+  
+In this snippet, we continue wrangling the LAD BED files, generating two BED/DGE overlap objects, one for DGEs overlapping LADs and one for DGEs overlapping non-LAD regions.  
+
+```{r, eval = FALSE}
+
+## BED dir
+bed.dir <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Raw_Data/BEDs"
+list.files(bed.dir)
+
+## Get chrom names and sizes (formatted for ensemble)
+chrom.dir <- "/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Raw_Data/Annotations"
+list.files(chrom.dir)
+
+## Genomic coordinates for all coding genes in hg38
+gene.pos <- read.table(file.path(chrom.dir, "hg38_gene_positions.csv"), sep= ",", header= T)
+
+## Convert to Genomic Ranges data
+gr.gene.pos <- as.data.frame(gene.pos)
+gr.gene.pos <- gr.gene.pos %>% 
+  transform( seqnames= paste0("chr",gr.gene.pos$chromosome_name), start = gr.gene.pos$start_position, end = gr.gene.pos$end_position)  %>% 
+  as_granges()
+gr.gene.pos
+
+##------------------------------Luay's Lamin B1 B2------------------------------##
+## Using Luay's BED file for Lamin B1 and B2
+bed.lmb1 <- read_bed(file.path(bed.dir, "LMB1_4DNFICCV71TZ.bed") , col_names = NULL, genome_info = "hg38")
+bed.lmb1
+
+bed.lmb2 <- read_bed(file.path(bed.dir, "LMB2_4DNFIBQH62LX.bed") , col_names = NULL, genome_info = "hg38")
+bed.lmb2
+
+## Union of lmb1 and lmb2 files
+bed.lam.union <- GenomicRanges::reduce(c(bed.lmb1, bed.lmb2))
+bed.lam.union
+
+##----------------------------------Parse LADs----------------------------------##
+## Name all of the peaks based on their genomic position
+names(bed.lam.union) = paste0(seqnames(bed.lam.union),':',start(bed.lam.union),'-',end(bed.lam.union))
+
+## Assign names to temp variable
+region.names <- names(bed.lam.union)
+
+## Find intersection between LADs and all genes
+## intersect_rng <- join_overlap_intersect(query, subject) https://bioconductor.org/packages/devel/bioc/vignettes/plyranges/inst/doc/an-introduction.html
+lamin.overlaps <- join_overlap_intersect(bed.lam.union, gr.gene.pos)
+
+## Find non-overlapping regions https://support.bioconductor.org/p/74077/ sp over() method gr1[!gr1 %over% gr2,]
+non.lamins <- gr.gene.pos[!gr.gene.pos %over% lamin.overlaps,]
+
+##--------------------------------------------------##
+##--If analyzing Lamin 1 and 2 overlaps seperately--##
+#lamin1.overlaps <- join_overlap_intersect(bed.lmb1, gr.gene.pos)
+#lamin2.overlaps <- join_overlap_intersect(bed.lmb2, gr.gene.pos)
+
+##---------------------------Overlaps: Data Wrangling---------------------------##
+
+## Convert to data frame
+lamin.overlaps <- as.data.frame(lamin.overlaps, row.names = seq(1:29268))
+##--------------------------------------------------##
+##--If analyzing Lamin 1 and 2 overlaps seperately--##
+#lamin1.overlaps <- as.data.frame(lamin1.overlaps, row.names = seq(1:22140))
+#lamin2.overlaps <- as.data.frame(lamin1.overlaps, row.names = seq(1:28045))
+
+## Remove non-unique Ensembl IDs
+lamin.overlaps <-lamin.overlaps %>%  
+  distinct(ensembl_gene_id,.keep_all = T ) 
+rownames(lamin.overlaps) <-lamin.overlaps$ensembl_gene_id
+
+## Convert to data frame
+non.lamins <- as.data.frame(non.lamins, row.names = seq(1:33360))
+
+## Remove non-unique Ensembl IDs
+non.lamins <-non.lamins %>%  
+  distinct(ensembl_gene_id,.keep_all = T ) 
+rownames(non.lamins) <-non.lamins$ensembl_gene_id
+
+
+```
+
+#### Generate volcano plots of DEGs within LADs  
+  
+Uses previously defined volcano plot function.  
+
+```{r, eval = FALSE}
+## Convert results  to DF
+res.12hr.df <- as.data.frame(res.12hr) 
+res.48hr.df <- as.data.frame(res.48hr)
+res.144hr.df <- as.data.frame(res.144hr) 
+
+## Filter by ensembl ID and lfc
+res.12hr.ov <-res.12hr.df %>%
+  filter(rownames(res.12hr.df) %in% lamin.overlaps$ensembl_gene_id) 
+res.48hr.ov <-res.48hr.df %>%
+  filter(rownames(res.48hr.df) %in% lamin.overlaps$ensembl_gene_id) 
+res.144hr.ov <-res.144hr.df %>%
+  filter(rownames(res.144hr.df) %in% lamin.overlaps$ensembl_gene_id) 
+
+## Volcano plots of lamin intersctions
+DE_Vol_Plot(res.12hr.ov,"Lamin KO at 12 Hours: Within LADs", "res.12hr.LADs.volplot" )
+DE_Vol_Plot(res.48hr.ov,"Lamin KO at 48 Hours: Within LADs", "res.48hr.LADs.volplot" )
+DE_Vol_Plot(res.144hr.ov,"Lamin KO at 144 Hours: Within LADs", "res.144hr.LADsvolplot" )
+
+## Volcano plots of lamin intersctions with p value =0.1 and lfc = 0.58
+DE_Vol_Plot(res.12hr.ov,"Lamin KO at 12 Hours: Within LADs pv=0.1.", "res.12hr.LADs.pv0.1.volplot" )
+DE_Vol_Plot(res.48hr.ov,"Lamin KO at 48 Hours: Within LADs pv=0.1.", "res.48hr.LADs.pv0.1.volplot" )
+DE_Vol_Plot(res.144hr.ov,"Lamin KO at 144 Hours: Within LADs pv=0.1.", "res.144hr.LADs.pv0.1.volplot" )
+
+
+```
+
+#### Generate volcano plots of DEGs outsideLADs  
+
+```{r, eval = FALSE}
+
+## Filter by ensembl ID and lfc
+res.12hr.non <-res.12hr.df %>%
+  filter(rownames(res.12hr.df) %in% non.lamins$ensembl_gene_id) 
+res.48hr.non <-res.48hr.df %>%
+  filter(rownames(res.48hr.df) %in% non.lamins$ensembl_gene_id) 
+res.144hr.non <-res.144hr.df %>%
+  filter(rownames(res.144hr.df) %in% non.lamins$ensembl_gene_id)
+
+## Volcano plots of non-lamin exluded genes
+DE_Vol_Plot(res.12hr.non,"Lamin KO at 12 Hours: Outside LADs", "res.12hr.nonLADs.volplot" )
+DE_Vol_Plot(res.48hr.non,"Lamin KO at 48 Hours: Outside LADs", "res.48hr.nonLADs.volplot" )
+DE_Vol_Plot(res.144hr.non,"Lamin KO at 144 Hours: Outside LADs", "res.144hr.nonLADsvolplot" )
+
+## Volcano plots of lamin intersctions with p value =0.1 and lfc = 0.58
+DE_Vol_Plot(res.12hr.non,"Lamin KO at 12 Hours: Outside LADs pv=0.1.", "res.12hr.nonLADs.pv0.1.volplot" )
+DE_Vol_Plot(res.48hr.non,"Lamin KO at 48 Hours: Outside LADs pv=0.1.", "res.48hr.nonLADs.pv0.1.volplot" )
+DE_Vol_Plot(res.144hr.non,"Lamin KO at 144 Hours: Outside LADs pv=0.1.", "res.144hr.nonLADs.pv0.1.volplot" )
+
+```
+
+#### Trajectory Plot
+
+The following code generates a trajectory plot using the ratio of LAD DEGs and non-LAD DEGs in contrast to all DEGs at each timepoint. 
+
+```{r, eval = FALSE}
+
+## Organize genes by significance and extract
+get_Ratio <- function(results.ov, results.non){
+  degs.ov <- rownames(results.ov[results.ov$padj <= 0.01 & abs(results.ov$log2FoldChange) > abs(1),])
+  degs.non <- rownames(results.non[results.non$padj <= 0.01 & abs(results.non$log2FoldChange) > abs(1),])
+  ratio = as.numeric(round(length(degs.ov)/length(degs.non), 4))
+  return(ratio)
+}
+
+## Call functions
+hr.12 <- get_Ratio(res.12hr.ov, res.12hr.non)
+hr.48 <- get_Ratio(res.48hr.ov, res.48hr.non)
+hr.144 <- get_Ratio(res.144hr.ov, res.144hr.non)
+
+hr.12.ov <- get_Ratio(res.12hr.ov, res.12hr)
+hr.48.ov <- get_Ratio(res.48hr.ov, res.48hr)
+hr.144.ov <- get_Ratio(res.144hr.ov, res.144hr)
+
+hr.12.non <- get_Ratio(res.12hr.non, res.12hr)
+hr.48.non <- get_Ratio(res.48hr.non, res.48hr)
+hr.144.non <- get_Ratio(res.144hr.non, res.144hr)
+
+list.non <- rbind(hr.12.non, hr.48.non, hr.144.non)
+list.ov <- rbind(hr.12.ov, hr.48.ov, hr.144.ov)
+list.all <- rbind(hr.12, hr.48, hr.144)
+
+## Prepare data for plotting
+name <- c(rep(c("LAD DEGs/Non-LAD DEGs"),3), rep(c("LAD DEGs"),3),rep(c("Non-LAD DEGs"),3))
+time <- rep(c("12hrs", "48hrs","6 Day Washoff"), 3)
+factor <- rep(c(1,2,3), 3)
+list <- rbind(list.all,list.ov, list.non)
+list <- as.data.frame(cbind(list, name, time, factor))
+colnames(list) <- c("ratio","name","time","factor")
+
+#f3e79b,#fac484,#f8a07e,#eb7f86,#ce6693,#a059a0,#5c53a5
+
+## Plot data
+p <- list %>% 
+  mutate(time = fct_reorder(time, factor)) %>%
+  ggplot(aes(x= time, y= as.numeric(ratio), group = name)) + 
+  geom_line(aes(color=name)) + geom_point(aes(color=name), size=8) + 
+  plottheme +
+  scale_y_continuous(limits = c(0,1),breaks=c(0.0, 0.1,0.2,0.3,0.4,0.5, 0.6, 0.7, 0.8,0.9, 1.0))+
+  scale_x_discrete(limits = c("12hrs", "48hrs","6 Day Washoff"), expand = c(0.025, 0.025)) +
+ scale_color_manual(values=c("#f8a07e","#ce6693","#5c53a5"))+
+ theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust=1, size = 15))+ ylab("DEG Ratio") + xlab("Timepoint") +
+  ggtitle("Trajectory Plot")
+p
+
+```
+
+#### Generate boxplots of absolute LFC, log 10 adj P-value, and standard error for DEGs within and outside of LADs  
+  
+This section of code generates a set of boxplots to explore the change between DEGs within and outside of LADs for each condition, in addition to comparing the variance between DEGs.  
+
+```{r, eval = FALSE}
+##-------------------------Box Plot: Lamin intersections-------------------------##
+
+## Merge data
+res.12hr.non <-res.12hr.non %>%
+  mutate(group =rep("12hr nonoverlapping", nrow(res.12hr.non)))%>%
+  mutate(factor =rep(6, nrow(res.12hr.non)))
+res.12hr.ov <-res.12hr.ov %>%
+  mutate(group =rep("12hr overlapping", nrow(res.12hr.ov)))%>%
+  mutate(factor =rep(5, nrow(res.12hr.ov)))
+
+res.48hr.non <-res.48hr.non %>%
+  mutate(group =rep("48hr nonoverlapping", nrow(res.48hr.non)))%>%
+  mutate(factor =rep(4, nrow(res.48hr.non)))
+res.48hr.ov <-res.48hr.ov %>%
+  mutate(group =rep("48hr overlapping", nrow(res.48hr.ov)))%>%
+  mutate(factor =rep(3, nrow(res.48hr.ov)))
+
+res.144hr.non <-res.144hr.non %>%
+  mutate(group =rep("144hr nonoverlapping", nrow(res.144hr.non)))%>%
+  mutate(factor =rep(2, nrow(res.144hr.non)))
+res.144hr.ov <-res.144hr.ov %>%
+  mutate(group =rep("144hr overlapping", nrow(res.144hr.ov)))%>%
+  mutate(factor =rep(1, nrow(res.144hr.ov)))
+
+## Plot all three conditions
+plot.all <- rbind(res.12hr.non, res.12hr.ov, res.48hr.non, res.48hr.ov, res.144hr.non, res.144hr.ov)
+
+## Filters to apply for each boxplot
+plot.all <-plot.all%>%
+  filter(abs(log2FoldChange) > 1 ) %>%
+  filter(padj < 0.01 )
+
+plot.all <-plot.all %>%
+  mutate(log2FoldChange=abs(log2FoldChange))
+
+plot.all <-plot.all %>%
+  mutate(padj=abs(log(padj)))
+
+plottheme<-theme(panel.background = element_blank(),panel.border=element_rect(fill=NA),
+                 panel.grid.major = element_line(),
+                 panel.grid.minor = element_line(),
+                 strip.background=element_blank(), axis.text.x=element_text(family="Arial", colour="dark blue"), axis.title.x=element_text(face="bold", size=20,family="Arial", colour="dark blue", vjust=-2),
+                 axis.text.y=element_text(family="Arial", colour="dark blue"), 
+                 axis.title.y=element_text(face="bold", size=15, family="Arial", colour="dark blue", vjust=2),
+                 text = element_text(size=10, family="Arial"), 
+                 plot.title=element_text(size=20, face="bold", family="Arial", color="tomato", hjust=0.0, vjust=10, lineheight=1.5),
+                 plot.subtitle=element_text(size=15, face="bold", family="Aria", color="black", hjust=0.0, lineheight=1.5),
+                 legend.title = element_text(size=12, color= "tomato",face="bold"), 
+                 legend.text = element_text(size=10),
+                 legend.key=element_rect(fill=NA),
+                 axis.ticks=element_line(colour="black"))
+
+## Box plot of absolute LFC for each group "#00204DFF", "#EE82EE", "#48D1CC"
+plot.all%>% #Padj_Filter0.05_LADS_LFC_BoxPlot 12hrs_144hrs_Padj0.05_LADS_LFC_BoxPlot
+mutate(group = fct_reorder(group, desc(factor))) %>%
+ggplot(aes(x=as.factor(group), y=log2FoldChange, fill=group)) + 
+  geom_boxplot(alpha=0.75, outlier.shape = NA) + plottheme + scale_fill_manual(values = c("#48D1CC", "#EE82EE", "#48D1CC", "#EE82EE", "#48D1CC", "#EE82EE"))+
+  xlab("") +  scale_y_continuous(name="Absolute LFC", limits=c(0.5,4), breaks=c(0.5,1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0))+
+  labs(title="No P Adjusted Filter") + scale_x_discrete(labels=c("12Hrs outside LADs", "12Hrs inside LADs","48Hrs outside LADs", "48Hrs inside LADs","6 Days outside LADs", "6 Days inside LADs")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+## Box plot of log P Adjusted for each group
+plot.all %>% #Padj_Filter0.05_LADS_Padj_BoxPlot 12hrs_144hrs_Padj0.05_LADS_Padj_BoxPlot
+  mutate(group = fct_reorder(group, desc(factor))) %>%
+  ggplot(aes(x=as.factor(group), y=padj, fill=group)) + 
+  geom_boxplot(alpha=0.75) + plottheme + scale_fill_manual(values = c("#48D1CC", "#EE82EE", "#48D1CC", "#EE82EE"))+
+  scale_y_continuous(name="Log Padj", limits=c(0,125), breaks=c(0,25, 50, 75, 100, 125))+
+  labs(title="P Adjusted < 0.05") + scale_x_discrete(labels=c("12Hrs outside LADs", "12Hrs inside LADs","48Hrs outside LADs", "48Hrs inside LADs","6 Days outside LADs", "6 Days inside LADs")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+## Box plot of SE for each group
+plot.all %>% #Padj_Filter0.05_LADS_Padj_BoxPlot LADS_SE_BoxPlot
+  mutate(group = fct_reorder(group, desc(factor))) %>%
+  ggplot(aes(x=as.factor(group), y=lfcSE, fill=group)) + 
+  geom_boxplot(alpha=0.75, outlier.shape = NA) + plottheme + scale_fill_manual(values = c("#48D1CC", "#EE82EE", "#48D1CC", "#EE82EE", "#48D1CC", "#EE82EE"))+
+  scale_y_continuous(name="Standard Error", limits=c(0,5), breaks=c(0,1,2,3,4,5))+
+  labs(title="P Adjusted < 0.05") + scale_x_discrete(labels=c("12Hrs outside LADs", "12Hrs inside LADs","48Hrs outside LADs", "48Hrs inside LADs","6 Days outside LADs", "6 Days inside LADs")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+#### Barplot of DEGs within and outside of LADs  
+  
+Here, we compare how many DEGs are within and outside of LADs across all three conditions and summarize these results in a single boxplot.  
+
+```{r, eval = FALSE}
+##------------------------Bar Plot: DEGs within/out LADs------------------------##
+
+## Get DEGs for plotting relative fraction of DEGs in each group
+res <- res.144hr.l2
+res <-res%>%
+  filter(abs(log2FoldChange) > 0.58 ) %>%
+  filter(padj < 0.1 )
+
+dge <- c(125,159,11,13,17,29,9,14)
+day <- c( "All genes - Lamin1 LADs", "All genes - Lamin2 LADs", "12 hrs DEGs - Lamin1 LADs", "12 hrs DEGs - Lamin2 LADs", 
+          "48 hrs DEGs - Lamin1 LADs", "48 hrs DEGs - Lamin2 LADs", "144 hrs DEGs - Lamin1 LADs", "144 hrs DEGs - Lamin2 LADs")
+cond <- rep(c("Lamin1 LADs" , "Lamin2 LADs") , 4)
+factor <- c(8,7,6,5,4,3,2,1)
+plot.df <- data.frame(cond, day, dge, factor)
+
+## Plot box of DEGs #DEGs_LADs_L1_L2
+plot.df %>%
+  mutate(day = fct_reorder(day, factor, .desc=T)) %>%
+  ggplot(aes(y=dge, x=day, color = cond)) + plottheme+
+  geom_bar(position=position_dodge(0.9), stat="identity", width=0.8, fill="white") + 
+  scale_color_manual(values = c( "black","#0047AB", "#D22B2B"))+ theme(axis.text.x = element_text(angle = 45,  hjust=1) )+
+  geom_text(aes(label=dge), position = position_dodge(width = 0.875),hjust = 0.5, vjust=-0.5, size=3.5) + xlab("Day") + ylab("Differentially Expressed Genes")
+
+```
+
+#### Write Out LAD Intersection Results  
+
+```{r, eval = FALSE}
+## Get DEGs for plotting relative fraction of DEGs in each group
+res <- res.144hr.l2
+res <-res%>%
+  filter(abs(log2FoldChange) > 0.58 )%>%
+  filter(padj < 0.05 )
+
+dir = "/Users/lucascarter/Documents/IBiS/Backman_Lab/projects/Emily/Lamins_RNAseq/Results/"
+filename = "144hrDEGs_Within_LMB2_LADs"
+
+write.csv(res, file=paste0(dir,filename, ".csv"), row.names=FALSE)
+
+```
+#### DE gene pheatmap  
+
+An alternative function to generate a heatmap of differentially expressed genes that uses the [Pheatmap package](https://www.rdocumentation.org/packages/pheatmap/versions/1.0.12/topics/pheatmap) for the final plot. The benefit of using Pheatmap is that it generates a dendogram to accompany clustered heatmap. __This code was used to make heatmaps of DEGs within LADs and outside of LADs for each as exploratory data__  
+  
+_This function uses many of the same inputs as Heat_Map_Counts()_   
+
+```{r, eval = FALSE}
+## Set colors for annotations
+q_colors =  12 # for no particular reason
+v_colors =  viridis(q_colors, option = "E") # E= Civis
+v_colors
+
+Gene_pHeat_Map <- function(results, title, gene.n = gene.n, padj = 0.05, lfc.abs = 0.58, sample.n = 1:8, c.width = c.width, c.height = c.height, f.size.row=4,
+                           f.size.col=10, f.size=10, cols=colorRampPalette(c("#0047AB", "white", "#D22B2B"))(30), 
+                           meta.annotation=c("Conditions", "Replicate"),
+                           anno.colors = list(Replicate = c("1" = "#000004FF", "2" = "#5E626EFF"), 
+                                             Conditions = c("0hr" = "#00204DFF", "12hr" = "#00336FFF", "48hr" = "#39486BFF", "144hr" = "#575C6DFF"))
+                           ) {
+  require(pheatmap)
+  require(viridis)
+  require(dendsort)
+  require(DESeq2)
+  
+  sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
+  
+  ## Remove .## version of gene in ensembl ID
+  #rownames(results) <- gsub("\\..*","",rownames(results))
+  #rownames(dds) <- gsub("\\..*","",rownames(dds))
+  
+  ## Regularized log transformation, count extraction, and normalization
+  rld <- DESeq2::rlog(dds, blind = FALSE)
+  assay <-t(scale(t(assay(rld)[,sample.n])))
+  
+  ## Remove .## version of gene in ensembl ID
+  rownames(assay) <- gsub("\\..*","",rownames(assay))
+  
+  ## Organize genes by significance and extract
+  sig.genes <- rownames(results[results$padj <= padj & abs(results$log2FoldChange) > abs(lfc.abs),])
+  results <- as.data.frame(results[rownames(results) %in% sig.genes,])
+  results <- results %>% 
+    dplyr::distinct(symbol, .keep_all = T)
+  
+  ## Order genes by  pAdj, and extract N genes for heatmap
+  results <- results[order(results$padj, decreasing = F),]
+  print(results)
+  #results <- as.data.frame(results[order(results$log2FoldChange, decreasing = FALSE),])[gene.n,]
+  results <- as.data.frame(results)[gene.n,]
+  results
+  
+  ## Prepare data frame for heatmapping 
+  top.heat <- as.data.frame(assay[rownames(assay)%in%rownames(results),]) 
+  top.heat
+  ## Compute a distance calculation on both dimensions of the matrix for clustering
+  #distance.gene <- dist(as.data.frame(assay[rownames(results),])) ## average distance method
+  distance.gene <- as.dist((1 - cor(t(as.data.frame(assay[rownames(results),]))))/2) ## correlation method
+  distance.sample <- dist(t(as.data.frame(assay[rownames(results),])))
+  
+  # Cluster based on the distance calculations
+  #cluster.gene <- hclust(distance.gene, method="average") ## average distance method
+  cluster.gene=hclust(distance.gene) ## correlation method
+  cluster.sample <- hclust(distance.sample, method="average")
+  
+  ## Annotation information in data frame object
+  dfcol <- as.data.frame(colData(dds)[,meta.annotation])
+
+  # plot heat map
+  p<-pheatmap(top.heat, 
+              color = cols,
+              fontsize = f.size,
+              fontsize_row = f.size.row, 
+              fontsize_col = f.size.col,
+              cellwidth = c.width,
+              cellheight = c.height,
+              cluster_cols= F,
+              #cluster_cols= cluster.sample,
+              cluster_rows= cluster.gene,
+              main = title,
+              annotation_colors = anno.colors,
+              labels_row = results$symbol,
+              show_rownames = T,
+              border_color = NA,
+              annotation_legend = TRUE,
+              annotation_col = dfcol
+              )
+ 
+  return(p)
+  
+}
+
+## Call function here 
+Gene_pHeat_Map(res.12hr.ov, "LAD overlapping", gene.n=1:100, c.width = 7, c.height = 4) #12hr_inLADS_heatmap_top100
+Gene_pHeat_Map(res.12hr.non, "LAD non-overlapping", gene.n=1:100, c.width = 7, c.height = 4) #12hr_outsideLADS_heatmap_top100
+
+Gene_pHeat_Map(res.48hr.ov, "LAD overlapping", gene.n=1:100, c.width = 9, c.height = 6) #48hr_inLADS_heatmap_top100
+Gene_pHeat_Map(res.48hr.non, "LAD non-overlapping", gene.n=1:100, c.width = 9, c.height = 6) #48hr_outsideLADS_heatmap_top100
+
+Gene_pHeat_Map(res.144hr.ov, "LAD overlapping", gene.n=1:100, c.width = 7, c.height = 4) #144hr_inLADS_heatmap_top100
+Gene_pHeat_Map(res.144hr.non, "LAD non-overlapping", gene.n=1:100, c.width = 7, c.height = 4) #144hr_outsideLADS_heatmap_top100
+
+```
+
+#### DE gene pheatmap: Publication figures  
+  
+ __This code was used to make the final heatmaps of DEGs within LADs and outside of LADs that were used in the main DEG figure.__ cutoffs were LFC -+ 1 and Padj <0.01. 48hr DEG results were used.  
+
+```{r, eval = FALSE}
+Gene_pHeat_Map <- function(results, title, padj = 0.01, lfc.abs = 1, sample.n = 1:8, c.width = c.width, c.height = c.height, f.size.row=5,
+                           f.size.col=10, f.size=10, cols=colorRampPalette(c("#0047AB", "white", "#D22B2B"))(30), 
+                           meta.annotation=c("Conditions", "Replicate"),
+                           anno.colors = list(Replicate = c("1" = "#000004FF", "2" = "#5E626EFF"), 
+                                              Conditions = c("0hr" = "#00204DFF", "12hr" = "#00336FFF", "48hr" = "#39486BFF", "144hr" = "#575C6DFF"))
+) {
+  require(pheatmap)
+  require(viridis)
+  require(dendsort)
+  require(DESeq2)
+  
+  sort_hclust <- function(...) as.hclust(dendsort(as.dendrogram(...)))
+  
+  ## Remove .## version of gene in ensembl ID
+  #rownames(results) <- gsub("\\..*","",rownames(results))
+  #rownames(dds) <- gsub("\\..*","",rownames(dds))
+  
+  
+  ## Regularized log transformation, count extraction, and normalization
+  rld <- DESeq2::rlog(dds, blind = FALSE)
+  assay <-t(scale(t(assay(rld)[,sample.n])))
+  
+  ## Remove .## version of gene in ensembl ID
+  rownames(assay) <- gsub("\\..*","",rownames(assay))
+  
+  ## ----
+  res <- data.frame(res.48hr)
+  sig.genes <- rownames(res[res$padj <= padj & abs(res$log2FoldChange) > abs(lfc.abs),])
+  res <- as.data.frame(res[rownames(results) %in% sig.genes,])
+  res <- res %>% 
+    dplyr::distinct(symbol, .keep_all = T)
+  
+  res <- res[order(res$padj, decreasing = F),]
+  
+  res <- as.data.frame(res)[1:100,]
+  res <-rownames(res)
+  print(res)
+  
+  ## ----
+  
+  ## Organize genes by significance and extract
+  sig.genes <- rownames(results[results$padj <= padj & abs(results$log2FoldChange) > abs(lfc.abs),])
+  results <- as.data.frame(results[rownames(results) %in% sig.genes,])
+  results <- results %>% 
+    dplyr::distinct(symbol, .keep_all = T)
+  
+  ## Order genes by  pAdj, and extract N genes for heatmap
+  results <- results[order(results$padj, decreasing = F),]
+  #results <- as.data.frame(results[order(results$log2FoldChange, decreasing = FALSE),])[gene.n,]
+  results <- as.data.frame(results[rownames(results) %in% res,])
+  print(results)
+  
+  ## Prepare data frame for heatmapping 
+  top.heat <- as.data.frame(assay[rownames(assay)%in%rownames(results),]) 
+  top.heat
+  ## Compute a distance calculation on both dimensions of the matrix for clustering
+  #distance.gene <- dist(as.data.frame(assay[rownames(results),])) ## average distance method
+  distance.gene <- as.dist((1 - cor(t(as.data.frame(assay[rownames(results),]))))/2) ## correlation method
+  distance.sample <- dist(t(as.data.frame(assay[rownames(results),])))
+  
+  # Cluster based on the distance calculations
+  #cluster.gene <- hclust(distance.gene, method="average") ## average distance method
+  cluster.gene=hclust(distance.gene) ## correlation method
+  cluster.sample <- hclust(distance.sample, method="average")
+  
+  ## Annotation information in data frame object
+  dfcol <- as.data.frame(colData(dds)[,meta.annotation])
+  
+  # plot heat map
+  p<-pheatmap(top.heat, 
+              color = cols,
+              fontsize = f.size,
+              fontsize_row = f.size.row, 
+              fontsize_col = f.size.col,
+              cellwidth = c.width,
+              cellheight = c.height,
+              cluster_cols= F,
+              #cluster_cols= cluster.sample,
+              cluster_rows= cluster.gene,
+              main = title,
+              annotation_colors = anno.colors,
+              labels_row = results$symbol,
+              show_rownames = T,
+              border_color = NA,
+              annotation_legend = TRUE,
+              annotation_col = dfcol
+  )
+  
+  return(p)
+  
+}
+
+## Use these for new plots
+Gene_pHeat_Map(res.48hr.ov, "LAD overlapping", c.width = 9, c.height = 6) #48hr_inLADS_heatmap_top100
+Gene_pHeat_Map(res.48hr.non, "LAD non-overlapping", c.width = 9, c.height = 6) #48hr_outsideLADS_heatmap_top100
+
+```
+
+#### Gini Coefficients  
+  
+Using the [Ineq package](https://www.rdocumentation.org/packages/ineq/versions/0.2-13/topics/ineq), we calculate the Gini coefficients as a metric to determine the transcriptional divergence for each condition and plot these data as a trajectory plot.  
+
+```{r, eval = FALSE}
+
+library("ineq")
+library(ggridges)
+
+
+plottheme<-theme(panel.background = element_blank(),panel.border=element_rect(fill=NA),
+                 panel.grid.major = element_line(),
+                 #panel.grid.minor = element_line(colour = "tomato", size=.25, linetype = "dashed"),
+                 strip.background=element_blank(), axis.text.x=element_text(family="Arial", colour="dark blue"), axis.title.x=element_text(face="bold", size=20,family="Arial", colour="dark blue", vjust=-2),
+                 axis.text.y=element_text(family="Arial", colour="dark blue"), 
+                 axis.title.y=element_text(face="bold", size=15, family="Arial", colour="dark blue", vjust=2),
+                 text = element_text(size=10, family="Arial"), 
+                 plot.title=element_text(size=20, face="bold", family="Arial", color="tomato", hjust=0.0, vjust=10, lineheight=1.5),
+                 plot.subtitle=element_text(size=15, face="bold", family="Arial", color="black", hjust=0.0, lineheight=1.5),
+                 legend.title = element_text(size=12, color= "tomato",face="bold"), 
+                 legend.text = element_text(size=10),
+                 legend.key=element_rect(fill=NA),
+                 axis.ticks=element_line(colour="black"))
+
+##------------------------------Prepare data------------------------------##
+
+## Remove .## version of gene in ensembl ID
+rownames(dds) <- gsub("\\..*","",rownames(dds))
+
+# Pre-filtering the dataset
+nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+nrow(dds)
+
+## Get normalized counts
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+norm.counts <- counts(dds, normalized=TRUE)
+#norm.counts<- counts(dds)
+
+## Extract counts. Counts must be raw positive counts from non-normalized data
+cts.0hr <- norm.counts[,1:2] # 0hr counts (control)
+cts.12hr <- norm.counts[,3:4] # 12hr counts 
+cts.48hr <- norm.counts[,5:6] # 48hr counts 
+cts.144hr <- norm.counts[,7:8] # 144hr counts (washout)
+
+##------------------------------Gini Coefficients------------------------------##
+
+## Function to filter count data for Gini calculation
+filter_data <- function(data, filter){ #filter = lamin bed data, data = cts
+  
+  require(dplyr)
+  
+  rownames(data) <- gsub("\\..*","",rownames(data))
+  data <- as.data.frame(data)
+  data <-data %>%
+    filter(rownames(data) %in% filter$ensembl_gene_id) 
+  data <- as.data.frame(apply(data, 1, function (x) mean(x)))
+  
+  return(data)
+}
+
+## Filter data for each group: Non-LAD DEGs
+cts.0hr.non <- filter_data(cts.0hr, non.lamins)
+cts.12hr.non <- filter_data(cts.12hr, non.lamins)
+cts.48hr.non <- filter_data(cts.48hr, non.lamins)
+cts.144hr.non <- filter_data(cts.144hr, non.lamins)
+
+## Filter data for each group: LAD DEGs
+cts.0hr.ov <- filter_data(cts.0hr, lamin.overlaps)
+cts.12hr.ov <- filter_data(cts.12hr, lamin.overlaps)
+cts.48hr.ov <- filter_data(cts.48hr, lamin.overlaps)
+cts.144hr.ov <- filter_data(cts.144hr, lamin.overlaps)
+
+## Filter data for each group: All DEGs
+cts.0hr <- filter_data(cts.0hr, gene.pos)
+cts.12hr <- filter_data(cts.12hr, gene.pos)
+cts.48hr <- filter_data(cts.48hr, gene.pos)
+cts.144hr <- filter_data(cts.144hr, gene.pos)
+
+## Calculate Gini index for each treatment group
+list = c(cts.0hr, cts.12hr, cts.48hr, cts.144hr, cts.0hr.ov,cts.12hr.ov, cts.48hr.ov, cts.144hr.ov, 
+         cts.0hr.non, cts.12hr.non, cts.48hr.non, cts.144hr.non )
+
+## For loop to run Gini() and add factors of plotting
+factor.list <- c()
+gini.list <- c()
+for (i in 1:length(list)) {
+  this <- as.data.frame(list[i])
+  this <- as.data.frame(apply(this, 2, function (x) ineq::Gini(x)))
+  factor <- rep(i, times = 1, length.out = 1, each = 1)
+  gini.list <-rbind(gini.list,this)
+  factor.list <- c(factor.list, factor)
+  
+}
+
+## Prepare data for plotting
+rownames(gini.list) <- c("0hrs", "12hrs", "48hrs", "144hrs",
+                         "0hrs in LADs", "12hrs in LADs", "48hrs in LADs", "144hrs in LADs",
+                         "0hrs outside LADs", "12hrs outside LADs", "48hrs outside LADs", "144hrs outside LADs" )
+gini.list <- cbind(gini.list, factor.list)
+colnames(gini.list)  <- c("Gini", "factor")
+gini.list$Time <- c("0hrs", "12hrs", "48hrs", "6 Day Washoff", "0hrs","12hrs", "48hrs", "6 Day Washoff", "0hrs","12hrs", "48hrs", "6 Day Washoff")
+gini.list$factor <- c(1,2,3,4,1,2,3,4,1,2,3,4)
+gini.list$name <- c("All genes", "All genes", "All genes", "All genes", 
+                    "Genes in LADs", "Genes in LADs", "Genes in LADs", "Genes in LADs",
+                    "Genes outside LADs", "Genes outside LADs", "Genes outside LADs", "Genes outside LADs")
+
+## Plot data
+p <- gini.list %>% 
+  mutate(Time = fct_reorder(Time, factor)) %>%
+  ggplot(aes(x= Time, y= Gini, group=name)) + 
+  geom_line(aes(color=name)) + geom_point(aes(color=name), size=4) + 
+  #plottheme +
+  scale_y_continuous( limits=c(0.8,1), breaks=c(0.8, 0.825,0.85, 0.875, 0.9, 0.925, 0.95, 0.975, 1.0))+
+  scale_x_discrete(limits = c("0hrs","12hrs", "48hrs","6 Day Washoff"), expand = c(0.025, 0.025)) +
+  scale_color_manual(values=c("#00204DFF", "#EE82EE", "#48D1CC"))+
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust=1, size = 13))+
+  labs(title="Gini Coefficients", subtitle="Gini Coefficients", #subtitle="Top 1000 Variable Regions", 
+       caption="")
+p
+
+```
+
+#### Plot metascape results  
+  
+[Metascape](https://metascape.org/gp/index.html#/main/step1) was used to look at gene enrichment within and outside of LADs. These results were curated by hand by Dr. Luay Almassalha and plotted by category.  
+
+```{r, eval = FALSE}
+
+## Directory
+dir_meta <-"/Volumes/My Passport/projects/Emily/Lamins_RNAseq/Results/Metascape"
+list.files(dir_meta)
+setwd(dir_meta)
+
+## Read in Metascape results
+meta.lamin <- read.table(file.path(dir_meta, "Metascape_Results_Summary.csv"), sep= ",", header= TRUE, fill = TRUE ) #OFvOP_RNAseq_Dn_Stringent
+
+##  Build new data frame
+meta.lamin <- data.frame(meta.lamin)
+
+LAD = "in"
+#LAD = "out"
+Type = "cancer"
+#Type = "structural"
+
+meta.lamin <- meta.lamin[meta.lamin$LAD == LAD & meta.lamin$Type == Type,]
+
+# upregulated color: #D22B2B
+# downregulated color: #0047AB
+
+subset = "12 Hours within LADs "
+#subset = "12 Hours outside LADs "
+
+## Plot categories # DisGeNET_within_Cancer
+p.meta<-meta.lamin %>% 
+  mutate(Name = fct_reorder(Name, pvalue)) %>% 
+  ggplot(aes(x = pvalue, y = Name))+
+  geom_point(aes(colour = as.numeric(pvalue),size = as.numeric(pvalue)))+
+  scale_size_continuous(name="-Log 10 P Value")+
+  scale_color_continuous(low = "#0047AB", high = "#D22B2B", name="P Value")+
+  ggtitle(paste0("DisGeNET, ",subset," : ", Type))+ xlab("-Log 10 P Value")+ ylab("Annotation")+
+  scale_x_continuous( limits = c(0,7), breaks = c(0,1,2,3,4,5,6,7))+
+  theme(
+    axis.line = element_line(color = "darkblue", 
+                             size = 1, linetype = "solid"),
+    axis.text.y = element_text( color="#008080", size=14, family = "Arial Narrow"),
+    axis.text.x = element_text(angle = 0, color="black", size=12, family = "Arial Narrow"),
+    plot.title = element_text(hjust = 0.5, color="black", face = "bold", size=15,
+                              family = "Arial Rounded MT Bold"),
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    panel.background = element_blank()) 
+p.meta 
+
+
+```
+
+#### GO using Cluster Profiler  
+  
+[Cluster Profiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html) was used in addition to Metascape to determine gene enrichment for all conditions.  
+  
+This function expedites calls to enrichGO() and dotplot() from the [Cluster Profiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html) package.  
+  
+__Arguments__  
+  
+_results = the DESeq2 results object generated from DESeq::results()_  
+_ont = ontology used by cluster profiler. Must be "CC", "BP", or "MF"_  
+_title =  plot title (string)_  
+_filename = a string that the plot will be saves as_  
+_n.results = number of results returned by cluster profiler_  
+_plot.col = which values to color the dot plot with_  
+_dir.plt = plot directory _  
+  
+__Output:__ _Enrichment dot plot__  
+
+```{r, eval = FALSE}
+
+Enrich_GO <- function(results, ont, title, filename, n.results=10, x.axis="count", plot.col="qvalue", 
+                      dir.plt="/Users/lucascarter/Documents/IBiS/Backman_Lab/projects/Emily/Lamins_RNAseq/Results/Plots/LAD_plots/Cluster_Profiler"){
+  
+  require(clusterProfiler)
+  require(org.Hs.eg.db)
+  
+  GO.res.dn <- as.data.frame(results[which(results$log2FoldChange <= -0.58 & results$padj <= 0.05),])
+  GO.res.up <- as.data.frame(results[which(results$log2FoldChange >= 0.58 & results$padj <= 0.05),])
+
+  egoup <- enrichGO( gene          = rownames(GO.res.up),
+                     #universe      = names(results$symbol),
+                     OrgDb         = org.Hs.eg.db,
+                     keyType       = 'ENSEMBL',
+                     ont           = ont,
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = 0.05,
+                     qvalueCutoff  = 0.05,
+                     readable = TRUE)
+  print(egoup)
+  dot.p.up <- dotplot(egoup, x=x.axis, showCategory=n.results, color=plot.col ) + ggtitle(paste("UP",title))
+  ggsave(paste(dir.plt,"/",filename,"_UP",".png", sep=""), dpi=300)
+  print(dot.p.up)
+  
+  egodn <- enrichGO(   gene          = rownames(GO.res.dn),
+                       #universe      = names(results$symbol),
+                       OrgDb         = org.Hs.eg.db,
+                       keyType       = 'ENSEMBL',
+                       ont           = ont,
+                       pAdjustMethod = "BH",
+                       pvalueCutoff  = 0.05,
+                       qvalueCutoff  = 0.05,
+                       readable = TRUE)
+  
+  dot.p.dn <- dotplot(egodn, x=x.axis, showCategory=n.results, color=plot.col ) + ggtitle(paste("DN",title))
+  print(dot.p.dn)
+  ggsave(paste(dir.plt,"/",filename,"_DN", ".png", sep=""), dpi=300)
+  print(dot.p.dn)
+  
+}
+
+Enrich_GO(res.12hr, "MF", " GO Enrichment MF: 12 Hours","12hr_vs_cDN_GO_MF_dotplot")
+Enrich_GO(res.12hr, "CC", " GO Enrichment CC: 12 Hours","12hr_vs_cDN_GO_CC_dotplot")
+Enrich_GO(res.12hr, "BP", " GO Enrichment BP: 12 Hours","12hr_vs_cDN_GO_BP_dotplot")
+
+Enrich_GO(res.48hr, "MF", " GO Enrichment MF: 48 Hours","48hr_vs_cDN_GO_MF_dotplot")
+Enrich_GO(res.48hr, "CC", " GO Enrichment CC: 48 Hours","48hr_vs_cDN_GO_CC_dotplot")
+Enrich_GO(res.48hr, "BP", " GO Enrichment BP: 48 Hours","48hr_vs_cDN_GO_BP_dotplot")
+
+Enrich_GO(res.12hr.ov, "MF", " GO Enrichment MF in LADs: 12 Hours","12hr_vs_cDN_GO_MF_inLADs_dotplot")
+Enrich_GO(res.12hr.ov, "CC", " GO Enrichment CC in LADs: 12 Hours","12hr_vs_cDN_GO_CC_inLADs_dotplot")
+Enrich_GO(res.12hr.ov, "BP", "GO Enrichment BP in LADs: 12 Hours","12hr_vs_cDN_GO_BP_inLADs_dotplot")
+
+Enrich_GO(res.12hr.non, "MF", " GO Enrichment MF outside of LADs: 12 Hours","12hr_vs_cDN_GO_MF_outLADs_dotplot")
+Enrich_GO(res.12hr.non, "CC", " GO Enrichment CC outside of LADs: 12 Hours","12hr_vs_cDN_GO_CC_outLADs_dotplot")
+Enrich_GO(res.12hr.non, "BP", "GO Enrichment BP outside of LADs: 12 Hours","12hr_vs_cDN_GO_BP_outLADs_dotplot")
+
+```
